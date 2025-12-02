@@ -146,6 +146,28 @@ Compression is automatically detected and handled transparently when reading pix
 
 The library is optimized for high performance with the following features:
 
+### gocog vs GDAL Comparison
+
+One of the key advantages of gocog is its pure Go implementation, which avoids the overhead of loading GDAL's C library infrastructure. When comparing metadata retrieval operations against GDAL's `gdalinfo` utility:
+
+| File | gocog | gdalinfo | Speedup |
+|------|-------|----------|---------|
+| TCI.tif (15360x15872, 3 bands) | ~107µs | ~700ms | **~6,500x faster** |
+| B12.tif (7680x8192, 1 band) | ~90µs | ~690ms | **~7,500x faster** |
+
+Run the GDAL comparison tests yourself:
+
+```bash
+# Quick comparison test
+go test -v -run "TestCompareGDALvsGoCOG$"
+
+# Summary table
+go test -v -run "TestPrintSummary"
+
+# Full benchmarks (requires gdalinfo in PATH)
+go test -bench="BenchmarkGoCOG_OpenInfo|BenchmarkGDALInfo"
+```
+
 ### Optimizations
 
 - **Flat Memory Layout** - Raster data uses a flat `[]uint64` array instead of nested slices, reducing allocations from 771 to 1 and improving cache locality
@@ -159,7 +181,11 @@ The library is optimized for high performance with the following features:
 Run benchmarks with:
 
 ```bash
+# All benchmarks
 go test -bench=. -benchmem
+
+# GDAL comparison benchmarks
+go test -bench="BenchmarkGoCOG_OpenInfo|BenchmarkGDALInfo" -benchtime=3s
 ```
 
 Example results on Intel Core i9-9980HK (16 cores):
