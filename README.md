@@ -146,6 +146,42 @@ Compression is automatically detected and handled transparently when reading pix
 
 The library is optimized for high performance with the following features:
 
+### gocog vs Rasterio Comparison
+
+gocog is a pure Go implementation that avoids the overhead of Python's interpreter and GDAL's C library infrastructure. When comparing metadata retrieval operations against rasterio (Python library using GDAL):
+
+| File | gocog | rasterio | Speedup |
+|------|-------|----------|---------|
+| TCI.tif (local, 15360x15872, 3 bands) | ~242µs | ~28ms | **~115x faster** |
+| B12.tif (local, 7680x8192, 1 band) | ~280µs | ~30ms | **~108x faster** |
+| TCI.tif (remote, HTTP) | ~707ms | ~984ms | **~1.4x faster** |
+
+Run the rasterio comparison tests yourself:
+
+```bash
+# Quick comparison test (local files)
+go test -v -run "TestCompareRasterioVsGoCOG$"
+
+# URL comparison test (remote files)
+go test -v -run "TestCompareRasterioVsGoCOG_URL$"
+
+# Summary table (includes local and remote)
+go test -v -run "TestPrintRasterioSummary"
+
+# Full benchmarks (requires Python with rasterio installed)
+go test -bench="BenchmarkGoCOG_OpenInfo|BenchmarkGoCOG_OpenInfo_URL"
+
+# Run comprehensive comparison script (runs both Go and Python benchmarks)
+./compare_benchmarks.sh
+```
+
+**Note:** The comparison script requires Python with rasterio installed. Install dependencies with:
+```bash
+pip install -r requirements.txt
+# or with uv:
+uv pip install -r requirements.txt
+```
+
 ### gocog vs GDAL Comparison
 
 One of the key advantages of gocog is its pure Go implementation, which avoids the overhead of loading GDAL's C library infrastructure. When comparing metadata retrieval operations against GDAL's `gdalinfo` utility:
@@ -184,8 +220,14 @@ Run benchmarks with:
 # All benchmarks
 go test -bench=. -benchmem
 
+# Rasterio comparison benchmarks (local and remote)
+go test -bench="BenchmarkGoCOG_OpenInfo|BenchmarkGoCOG_OpenInfo_URL" -benchtime=3s
+
 # GDAL comparison benchmarks
 go test -bench="BenchmarkGoCOG_OpenInfo|BenchmarkGDALInfo" -benchtime=3s
+
+# Comprehensive comparison (Go + Python benchmarks)
+./compare_benchmarks.sh
 ```
 
 Example results on Intel Core i9-9980HK (16 cores):
