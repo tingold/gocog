@@ -17,6 +17,7 @@ A pure Go library for reading Cloud Optimized GeoTIFF (COG) files without any C/
 - **Map Tile Support** - Read standard map tiles (XYZ tiles) from COG files with automatic resampling
 - **Pixel Space Windows** - Read rectangular regions in pixel coordinates with automatic overview selection
 - **Optimized Metadata Reading** - Efficient metadata extraction using single-buffer reads and lazy loading
+- **High Performance** - Buffer pooling, parallel tile decompression, flat memory layout, and HTTP read-ahead buffering
 
 ## Installation
 
@@ -120,7 +121,15 @@ func main() {
 ### Types
 
 - `Rectangle` - Represents a rectangle in pixel space with fields: `X`, `Y`, `Width`, `Height`
-- `RasterData` - Contains raster data with fields: `Data [][][]uint64` (3D slice: [band][x][y]), `Width int`, `Height int`, `Bands int`, `Bounds orb.Bound`
+- `RasterData` - Contains raster data with fields:
+  - `Data []uint64` - Flat array in band-interleaved-by-pixel (BIP) format
+  - `Width`, `Height`, `Bands int` - Dimensions
+  - `Bounds orb.Bound` - Geographic bounds
+  - `At(band, x, y int) uint64` - Get pixel value at coordinates
+  - `Set(band, x, y int, value uint64)` - Set pixel value
+  - `AtUnchecked(band, x, y int) uint64` - Fast access without bounds checking
+  - `GetBand(band int) []uint64` - Extract single band as slice
+  - `GetPixel(x, y int) []uint64` - Get all band values for a pixel
 - `DataType` - Represents pixel data types: `DTByte`, `DTSByte`, `DTSShort`, `DTSShortS`, `DTSLong`, `DTSLongS`, `DTFloat`, `DTDouble`, `DTRational`, `DTSRational`, `DTASCII`, `DTUndefined`
 
 ### Compression Support
@@ -132,6 +141,60 @@ The library supports reading COG files with the following compression formats:
 - **JPEG** (JPEG compression for tiles/strips)
 
 Compression is automatically detected and handled transparently when reading pixel data.
+
+## Performance
+
+The library is optimized for high performance with the following features:
+
+### Optimizations
+
+- **Flat Memory Layout** - Raster data uses a flat `[]uint64` array instead of nested slices, reducing allocations from 771 to 1 and improving cache locality
+- **Buffer Pooling** - Reusable buffer pools via `sync.Pool` reduce GC pressure (620x faster buffer allocation)
+- **Parallel Tile Decompression** - Multi-core systems benefit from parallel decompression of compressed tiles
+- **Strip Caching** - Decompressed strips are cached to avoid redundant decompression
+- **HTTP Read-Ahead** - Sequential HTTP reads use read-ahead buffering for improved throughput
+
+### Benchmark Results
+
+Run benchmarks with:
+
+```bash
+go test -bench=. -benchmem
+```
+
+Example results on Intel Core i9-9980HK (16 cores):
+
+| Benchmark | Time | Allocations | Notes |
+|-----------|------|-------------|-------|
+| DecodeBytes 256x256x3 | 644µs | 1 alloc | Single allocation for flat array |
+| DecodeBytes 512x512x3 | 2.7ms | 1 alloc | Scales linearly with pixels |
+| Pixel Access (sequential) | 226µs | 0 allocs | Zero-copy access |
+| Pixel Access (direct) | 54µs | 0 allocs | Fastest via flat array iteration |
+| Buffer Alloc (new) | 27.9µs | 1 alloc | Standard allocation |
+| Buffer Alloc (pooled) | 45ns | 0 allocs | **620x faster** with pooling |
+| Parallel Tile Processing | 241µs | 34 allocs | 16 tiles in parallel |
+| Sequential Tile Processing | 898µs | 0 allocs | 16 tiles sequential |
+| COG Open (local file) | 104µs | 265 allocs | Metadata-only read |
+| COG ReadWindow 256x256 | 4.2ms | 44 allocs | Small window read |
+| COG ReadWindow 1024x1024 | 17.3ms | 159 allocs | Large window read |
+
+### Profiling
+
+For detailed profiling:
+
+```bash
+# CPU profiling
+go test -bench=BenchmarkCOG_ReadWindow -cpuprofile=cpu.prof
+go tool pprof cpu.prof
+
+# Memory profiling
+go test -bench=BenchmarkCOG_ReadWindow -memprofile=mem.prof
+go tool pprof mem.prof
+
+# Trace analysis
+go test -bench=BenchmarkCOG_ReadWindow -trace=trace.out
+go tool trace trace.out
+```
 
 ## License
 

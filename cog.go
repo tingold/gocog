@@ -10,7 +10,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/paulmach/orb"
@@ -27,13 +29,75 @@ type COG struct {
 	metadata   []*GeoTIFFMetadata
 }
 
-// RasterData represents raster data read from a COG
+// RasterData represents raster data read from a COG.
+// Data is stored as a flat array in band-interleaved-by-pixel (BIP) format:
+// index = y * Width * Bands + x * Bands + band
+// This provides better cache locality and fewer allocations than nested slices.
 type RasterData struct {
-	Data   [][][]uint64 // [band][x][y] - 3D slice: band number, x pixel, y pixel
+	Data   []uint64 // Flat array: [y * Width * Bands + x * Bands + band]
 	Width  int
 	Height int
 	Bands  int
 	Bounds orb.Bound
+}
+
+// At returns the value at the specified band, x, y coordinates.
+// This is the primary accessor method for pixel values.
+func (r *RasterData) At(band, x, y int) uint64 {
+	if band < 0 || band >= r.Bands || x < 0 || x >= r.Width || y < 0 || y >= r.Height {
+		return 0
+	}
+	return r.Data[y*r.Width*r.Bands+x*r.Bands+band]
+}
+
+// Set sets the value at the specified band, x, y coordinates.
+func (r *RasterData) Set(band, x, y int, value uint64) {
+	if band < 0 || band >= r.Bands || x < 0 || x >= r.Width || y < 0 || y >= r.Height {
+		return
+	}
+	r.Data[y*r.Width*r.Bands+x*r.Bands+band] = value
+}
+
+// AtUnchecked returns the value without bounds checking (faster but unsafe).
+// Only use when you're certain the coordinates are valid.
+func (r *RasterData) AtUnchecked(band, x, y int) uint64 {
+	return r.Data[y*r.Width*r.Bands+x*r.Bands+band]
+}
+
+// SetUnchecked sets the value without bounds checking (faster but unsafe).
+func (r *RasterData) SetUnchecked(band, x, y int, value uint64) {
+	r.Data[y*r.Width*r.Bands+x*r.Bands+band] = value
+}
+
+// Index returns the flat array index for the given band, x, y coordinates.
+func (r *RasterData) Index(band, x, y int) int {
+	return y*r.Width*r.Bands + x*r.Bands + band
+}
+
+// GetBand returns a slice of all pixel values for a single band.
+// The returned slice is newly allocated.
+func (r *RasterData) GetBand(band int) []uint64 {
+	if band < 0 || band >= r.Bands {
+		return nil
+	}
+	result := make([]uint64, r.Width*r.Height)
+	for y := 0; y < r.Height; y++ {
+		for x := 0; x < r.Width; x++ {
+			result[y*r.Width+x] = r.AtUnchecked(band, x, y)
+		}
+	}
+	return result
+}
+
+// GetPixel returns all band values for a single pixel.
+func (r *RasterData) GetPixel(x, y int) []uint64 {
+	if x < 0 || x >= r.Width || y < 0 || y >= r.Height {
+		return nil
+	}
+	result := make([]uint64, r.Bands)
+	baseIdx := y*r.Width*r.Bands + x*r.Bands
+	copy(result, r.Data[baseIdx:baseIdx+r.Bands])
+	return result
 }
 
 // TileInfo represents information about a tile
@@ -270,8 +334,8 @@ func (c *COG) ReadRegion(bound orb.Bound, overview int) (*RasterData, error) {
 		return nil, fmt.Errorf("IFD %d not found", overviewIndex)
 	}
 
-	// Decode bytes to 3D uint64 slice
-	decodedData := c.decodeBytesTo3D(data, width, height, meta.BandCount, meta.DataType, ifd.ByteOrder, meta.PhotometricInterpretation)
+	// Decode bytes to flat uint64 slice
+	decodedData := c.decodeBytesToFlat(data, width, height, meta.BandCount, meta.DataType, ifd.ByteOrder, meta.PhotometricInterpretation)
 
 	return &RasterData{
 		Data:   decodedData,
@@ -435,7 +499,9 @@ func (c *COG) decompressTile(data []byte, compression uint16, ifd *IFD, tileWidt
 		width := bounds.Dx()
 		height := bounds.Dy()
 		bytesPerPixel := bands * c.getBytesPerSample(dataType)
-		result := make([]byte, width*height*bytesPerPixel)
+		// Use pooled buffer for result
+		result := GetBuffer(width * height * bytesPerPixel)
+		result = result[:width*height*bytesPerPixel]
 
 		// Handle different image types
 		switch imgType := img.(type) {
@@ -490,7 +556,17 @@ func (c *COG) decompressTile(data []byte, compression uint16, ifd *IFD, tileWidt
 	}
 }
 
+// tileWorkItem represents work for parallel tile processing
+type tileWorkItem struct {
+	tileX, tileY     int
+	tileIndex        int
+	compressedData   []byte
+	decompressedData []byte
+	err              error
+}
+
 // readTiledRegion reads a region from a tiled image
+// Uses parallel decompression for improved performance on multi-core systems
 func (c *COG) readTiledRegion(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, height int) ([]byte, error) {
 	// Get compression type (default to None if not specified)
 	compression := uint16(CompressionNone)
@@ -527,7 +603,6 @@ func (c *COG) readTiledRegion(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, heig
 	tileByteCountsTag := ifd.Tags[325]
 
 	// Lazy load tile offsets if not already loaded
-	// Note: This reads the entire array, but it's cached after first read
 	if tileOffsetsTag != nil && tileOffsetsTag.Value == nil && tileOffsetsTag.IsOffset {
 		if err := c.tiffReader.ReadTagValue(ifd, 324); err != nil {
 			return nil, fmt.Errorf("failed to read tile offsets: %w", err)
@@ -568,116 +643,242 @@ func (c *COG) readTiledRegion(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, heig
 	bytesPerPixel := meta.BandCount * c.getBytesPerSample(meta.DataType)
 	output := make([]byte, width*height*bytesPerPixel)
 
-	// Read tiles and copy to output
+	// Collect all tiles that need to be read
+	var tiles []*tileWorkItem
 	for tileY := startTileY; tileY <= endTileY; tileY++ {
 		for tileX := startTileX; tileX <= endTileX; tileX++ {
 			tileIndex := tileY*tilesPerRow + tileX
 			if tileIndex >= len(tileOffsets) {
 				continue
 			}
+			tiles = append(tiles, &tileWorkItem{
+				tileX:     tileX,
+				tileY:     tileY,
+				tileIndex: tileIndex,
+			})
+		}
+	}
 
-			tileOffset := tileOffsets[tileIndex]
-			tileSize := tileByteCounts[tileIndex]
+	// If only one tile or no compression, use sequential processing
+	if len(tiles) <= 1 || compression == CompressionNone {
+		return c.readTiledRegionSequential(ifd, meta, x, y, width, height, tileWidth, tileHeight,
+			tilesPerRow, tileOffsets, tileByteCounts, compression, bytesPerPixel, output, tiles)
+	}
 
-			// Read tile data
-			tileData := make([]byte, tileSize)
-			if _, err := c.reader.Seek(int64(tileOffset), io.SeekStart); err != nil {
-				return nil, fmt.Errorf("failed to seek to tile: %w", err)
-			}
-			if _, err := io.ReadFull(c.reader, tileData); err != nil {
-				return nil, fmt.Errorf("failed to read tile: %w", err)
-			}
+	// Phase 1: Read all compressed tile data sequentially (I/O bound)
+	for _, tile := range tiles {
+		tileOffset := tileOffsets[tile.tileIndex]
+		tileSize := tileByteCounts[tile.tileIndex]
 
-			// Decompress tile data if needed
-			decompressedTile, err := c.decompressTile(tileData, compression, ifd, tileWidth, tileHeight, meta.BandCount, meta.DataType)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decompress tile: %w", err)
-			}
-			tileData = decompressedTile
-
-			// Calculate the intersection of the tile and the requested region
-			tileStartX := tileX * tileWidth
-			tileStartY := tileY * tileHeight
-			tileEndX := tileStartX + tileWidth
-			tileEndY := tileStartY + tileHeight
-
-			// Clamp to requested region bounds
-			regionStartX := x
-			regionStartY := y
-			regionEndX := x + width
-			regionEndY := y + height
-
-			// Find intersection
-			copyStartX := regionStartX
-			if tileStartX > copyStartX {
-				copyStartX = tileStartX
-			}
-			copyStartY := regionStartY
-			if tileStartY > copyStartY {
-				copyStartY = tileStartY
-			}
-			copyEndX := regionEndX
-			if tileEndX < copyEndX {
-				copyEndX = tileEndX
-			}
-			copyEndY := regionEndY
-			if tileEndY < copyEndY {
-				copyEndY = tileEndY
-			}
-
-			// If no intersection, skip this tile
-			if copyStartX >= copyEndX || copyStartY >= copyEndY {
-				continue
-			}
-
-			copyWidth := copyEndX - copyStartX
-			copyHeight := copyEndY - copyStartY
-
-			// Calculate offsets within tile and output buffer
-			tileOffsetX := copyStartX - tileStartX     // Offset within tile
-			tileOffsetY := copyStartY - tileStartY     // Offset within tile
-			outputOffsetX := copyStartX - regionStartX // Offset within output
-			outputOffsetY := copyStartY - regionStartY // Offset within output
-
-			// Copy tile data to output
-			for row := 0; row < copyHeight; row++ {
-				// Source: tile data at (tileOffsetX, tileOffsetY + row)
-				srcRowOffset := (tileOffsetY + row) * tileWidth * bytesPerPixel
-				srcOffset := srcRowOffset + tileOffsetX*bytesPerPixel
-
-				// Destination: output buffer at (outputOffsetX, outputOffsetY + row)
-				dstRowOffset := (outputOffsetY + row) * width * bytesPerPixel
-				dstOffset := dstRowOffset + outputOffsetX*bytesPerPixel
-
-				bytesToCopy := copyWidth * bytesPerPixel
-
-				// Bounds check: ensure we don't exceed tileData length
-				if srcOffset+bytesToCopy > len(tileData) {
-					bytesToCopy = len(tileData) - srcOffset
-					if bytesToCopy <= 0 {
-						break
-					}
+		// Read tile data using pooled buffer
+		tile.compressedData = GetBuffer(int(tileSize))
+		tile.compressedData = tile.compressedData[:tileSize]
+		if _, err := c.reader.Seek(int64(tileOffset), io.SeekStart); err != nil {
+			// Clean up on error
+			for _, t := range tiles {
+				if t.compressedData != nil {
+					PutBuffer(t.compressedData)
 				}
-
-				// Bounds check: ensure we don't exceed output buffer length
-				if dstOffset+bytesToCopy > len(output) {
-					bytesToCopy = len(output) - dstOffset
-					if bytesToCopy <= 0 {
-						break
-					}
-				}
-
-				// Copy the row
-				copy(output[dstOffset:dstOffset+bytesToCopy],
-					tileData[srcOffset:srcOffset+bytesToCopy])
 			}
+			return nil, fmt.Errorf("failed to seek to tile: %w", err)
+		}
+		if _, err := io.ReadFull(c.reader, tile.compressedData); err != nil {
+			// Clean up on error
+			for _, t := range tiles {
+				if t.compressedData != nil {
+					PutBuffer(t.compressedData)
+				}
+			}
+			return nil, fmt.Errorf("failed to read tile: %w", err)
+		}
+	}
+
+	// Phase 2: Decompress tiles in parallel (CPU bound)
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(tiles) {
+		numWorkers = len(tiles)
+	}
+
+	var wg sync.WaitGroup
+	workChan := make(chan *tileWorkItem, len(tiles))
+
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tile := range workChan {
+				tile.decompressedData, tile.err = c.decompressTile(
+					tile.compressedData, compression, ifd,
+					tileWidth, tileHeight, meta.BandCount, meta.DataType,
+				)
+				// Return compressed buffer to pool
+				PutBuffer(tile.compressedData)
+				tile.compressedData = nil
+			}
+		}()
+	}
+
+	// Send work to workers
+	for _, tile := range tiles {
+		workChan <- tile
+	}
+	close(workChan)
+
+	// Wait for all workers to complete
+	wg.Wait()
+
+	// Check for errors and copy data to output
+	for _, tile := range tiles {
+		if tile.err != nil {
+			// Clean up decompressed data
+			for _, t := range tiles {
+				if t.decompressedData != nil && compression == CompressionJPEG {
+					PutBuffer(t.decompressedData)
+				}
+			}
+			return nil, fmt.Errorf("failed to decompress tile: %w", tile.err)
+		}
+
+		// Copy tile data to output
+		c.copyTileToOutput(tile, output, x, y, width, height, tileWidth, tileHeight, bytesPerPixel)
+
+		// Return decompressed data to pool if it came from pool (JPEG only)
+		if compression == CompressionJPEG && tile.decompressedData != nil {
+			PutBuffer(tile.decompressedData)
 		}
 	}
 
 	return output, nil
 }
 
+// readTiledRegionSequential handles the simple case of sequential tile reading
+func (c *COG) readTiledRegionSequential(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, height int,
+	tileWidth, tileHeight, tilesPerRow int, tileOffsets, tileByteCounts []uint32,
+	compression uint16, bytesPerPixel int, output []byte, tiles []*tileWorkItem) ([]byte, error) {
+
+	for _, tile := range tiles {
+		tileOffset := tileOffsets[tile.tileIndex]
+		tileSize := tileByteCounts[tile.tileIndex]
+
+		// Read tile data using pooled buffer
+		tileData := GetBuffer(int(tileSize))
+		tileData = tileData[:tileSize]
+		if _, err := c.reader.Seek(int64(tileOffset), io.SeekStart); err != nil {
+			PutBuffer(tileData)
+			return nil, fmt.Errorf("failed to seek to tile: %w", err)
+		}
+		if _, err := io.ReadFull(c.reader, tileData); err != nil {
+			PutBuffer(tileData)
+			return nil, fmt.Errorf("failed to read tile: %w", err)
+		}
+
+		// Decompress tile data if needed
+		decompressedTile, err := c.decompressTile(tileData, compression, ifd, tileWidth, tileHeight, meta.BandCount, meta.DataType)
+		if compression != CompressionNone {
+			PutBuffer(tileData)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress tile: %w", err)
+		}
+		tile.decompressedData = decompressedTile
+
+		// Copy tile data to output
+		c.copyTileToOutput(tile, output, x, y, width, height, tileWidth, tileHeight, bytesPerPixel)
+
+		// Return decompressed data to pool if it came from pool (JPEG only)
+		if compression == CompressionJPEG {
+			PutBuffer(tile.decompressedData)
+		}
+	}
+
+	return output, nil
+}
+
+// copyTileToOutput copies decompressed tile data to the output buffer
+func (c *COG) copyTileToOutput(tile *tileWorkItem, output []byte, x, y, width, height, tileWidth, tileHeight, bytesPerPixel int) {
+	tileData := tile.decompressedData
+
+	// Calculate the intersection of the tile and the requested region
+	tileStartX := tile.tileX * tileWidth
+	tileStartY := tile.tileY * tileHeight
+	tileEndX := tileStartX + tileWidth
+	tileEndY := tileStartY + tileHeight
+
+	// Clamp to requested region bounds
+	regionStartX := x
+	regionStartY := y
+	regionEndX := x + width
+	regionEndY := y + height
+
+	// Find intersection
+	copyStartX := regionStartX
+	if tileStartX > copyStartX {
+		copyStartX = tileStartX
+	}
+	copyStartY := regionStartY
+	if tileStartY > copyStartY {
+		copyStartY = tileStartY
+	}
+	copyEndX := regionEndX
+	if tileEndX < copyEndX {
+		copyEndX = tileEndX
+	}
+	copyEndY := regionEndY
+	if tileEndY < copyEndY {
+		copyEndY = tileEndY
+	}
+
+	// If no intersection, skip this tile
+	if copyStartX >= copyEndX || copyStartY >= copyEndY {
+		return
+	}
+
+	copyWidth := copyEndX - copyStartX
+	copyHeight := copyEndY - copyStartY
+
+	// Calculate offsets within tile and output buffer
+	tileOffsetX := copyStartX - tileStartX     // Offset within tile
+	tileOffsetY := copyStartY - tileStartY     // Offset within tile
+	outputOffsetX := copyStartX - regionStartX // Offset within output
+	outputOffsetY := copyStartY - regionStartY // Offset within output
+
+	// Copy tile data to output
+	for row := 0; row < copyHeight; row++ {
+		// Source: tile data at (tileOffsetX, tileOffsetY + row)
+		srcRowOffset := (tileOffsetY + row) * tileWidth * bytesPerPixel
+		srcOffset := srcRowOffset + tileOffsetX*bytesPerPixel
+
+		// Destination: output buffer at (outputOffsetX, outputOffsetY + row)
+		dstRowOffset := (outputOffsetY + row) * width * bytesPerPixel
+		dstOffset := dstRowOffset + outputOffsetX*bytesPerPixel
+
+		bytesToCopy := copyWidth * bytesPerPixel
+
+		// Bounds check: ensure we don't exceed tileData length
+		if srcOffset+bytesToCopy > len(tileData) {
+			bytesToCopy = len(tileData) - srcOffset
+			if bytesToCopy <= 0 {
+				break
+			}
+		}
+
+		// Bounds check: ensure we don't exceed output buffer length
+		if dstOffset+bytesToCopy > len(output) {
+			bytesToCopy = len(output) - dstOffset
+			if bytesToCopy <= 0 {
+				break
+			}
+		}
+
+		// Copy the row
+		copy(output[dstOffset:dstOffset+bytesToCopy],
+			tileData[srcOffset:srcOffset+bytesToCopy])
+	}
+}
+
 // readStrippedRegion reads a region from a stripped image
+// Uses strip caching to avoid re-reading and re-decompressing the same strip multiple times
 func (c *COG) readStrippedRegion(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, height int) ([]byte, error) {
 	// Get compression type (default to None if not specified)
 	compression := uint16(CompressionNone)
@@ -738,9 +939,16 @@ func (c *COG) readStrippedRegion(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, h
 	// Allocate output buffer
 	output := make([]byte, width*height*bytesPerPixel)
 
-	// Read strips
-	for row := y; row < y+height; row++ {
-		stripIndex := row / rowsPerStrip
+	// Strip cache to avoid re-reading/re-decompressing the same strip
+	// Key: strip index, Value: decompressed strip data
+	stripCache := make(map[int][]byte)
+
+	// Calculate which strips we need
+	startStripIndex := y / rowsPerStrip
+	endStripIndex := (y + height - 1) / rowsPerStrip
+
+	// Pre-read and decompress all needed strips
+	for stripIndex := startStripIndex; stripIndex <= endStripIndex; stripIndex++ {
 		if stripIndex >= len(stripOffsets) {
 			continue
 		}
@@ -748,33 +956,72 @@ func (c *COG) readStrippedRegion(ifd *IFD, meta *GeoTIFFMetadata, x, y, width, h
 		stripOffset := stripOffsets[stripIndex]
 		stripSize := stripByteCounts[stripIndex]
 
-		// Read strip if needed
-		stripStartRow := stripIndex * rowsPerStrip
-		stripRow := row - stripStartRow
-
-		// Read the entire strip (could be optimized to read only needed rows)
-		stripData := make([]byte, stripSize)
+		// Read the entire strip using pooled buffer
+		compressedData := GetBuffer(int(stripSize))
+		compressedData = compressedData[:stripSize]
 		if _, err := c.reader.Seek(int64(stripOffset), io.SeekStart); err != nil {
+			PutBuffer(compressedData)
+			// Clean up cached strips
+			for _, cached := range stripCache {
+				PutBuffer(cached)
+			}
 			return nil, fmt.Errorf("failed to seek to strip: %w", err)
 		}
-		if _, err := io.ReadFull(c.reader, stripData); err != nil {
+		if _, err := io.ReadFull(c.reader, compressedData); err != nil {
+			PutBuffer(compressedData)
+			// Clean up cached strips
+			for _, cached := range stripCache {
+				PutBuffer(cached)
+			}
 			return nil, fmt.Errorf("failed to read strip: %w", err)
 		}
 
-		// Decompress strip data if needed
-		// Note: For efficiency, we should cache decompressed strips, but for now decompress each time
-		decompressedStrip, err := c.decompressTile(stripData, compression, ifd, meta.Width, rowsPerStrip, meta.BandCount, meta.DataType)
+		// Decompress strip data
+		decompressedStrip, err := c.decompressTile(compressedData, compression, ifd, meta.Width, rowsPerStrip, meta.BandCount, meta.DataType)
+		// Return compressed buffer to pool
+		if compression != CompressionNone {
+			PutBuffer(compressedData)
+		}
 		if err != nil {
+			// Clean up cached strips
+			for _, cached := range stripCache {
+				PutBuffer(cached)
+			}
 			return nil, fmt.Errorf("failed to decompress strip: %w", err)
 		}
-		stripData = decompressedStrip
+
+		stripCache[stripIndex] = decompressedStrip
+	}
+
+	// Now copy data from cached strips to output
+	for row := y; row < y+height; row++ {
+		stripIndex := row / rowsPerStrip
+		stripData, ok := stripCache[stripIndex]
+		if !ok {
+			continue
+		}
+
+		stripStartRow := stripIndex * rowsPerStrip
+		stripRow := row - stripStartRow
 
 		// Copy row data
 		srcOffset := stripRow*bytesPerRow + x*bytesPerPixel
 		dstOffset := (row - y) * width * bytesPerPixel
 
-		copy(output[dstOffset:dstOffset+width*bytesPerPixel],
-			stripData[srcOffset:srcOffset+width*bytesPerPixel])
+		// Bounds check for safety
+		if srcOffset+width*bytesPerPixel <= len(stripData) && dstOffset+width*bytesPerPixel <= len(output) {
+			copy(output[dstOffset:dstOffset+width*bytesPerPixel],
+				stripData[srcOffset:srcOffset+width*bytesPerPixel])
+		}
+	}
+
+	// Clean up cached strips (return to pool if they came from pool)
+	// Note: decompressed data from decompressTile may or may not be pooled
+	// depending on compression type, so we only return JPEG results to pool
+	for _, cached := range stripCache {
+		if compression == CompressionJPEG {
+			PutBuffer(cached)
+		}
 	}
 
 	return output, nil
@@ -796,25 +1043,24 @@ func (c *COG) getBytesPerSample(dt DataType) int {
 	}
 }
 
-// decodeBytesTo3D decodes byte data into a 3D uint64 slice [band][x][y]
-// The input byte data is in interleaved format: for each pixel, all bands are stored together
-func (c *COG) decodeBytesTo3D(data []byte, width, height, bands int, dataType DataType, byteOrder binary.ByteOrder, photometricInterpretation uint16) [][][]uint64 {
-	// Initialize the 3D slice: [band][x][y]
-	result := make([][][]uint64, bands)
-	for b := 0; b < bands; b++ {
-		result[b] = make([][]uint64, width)
-		for x := 0; x < width; x++ {
-			result[b][x] = make([]uint64, height)
-		}
-	}
+// decodeBytesToFlat decodes byte data into a flat uint64 slice.
+// The output is in band-interleaved-by-pixel (BIP) format:
+// index = y * width * bands + x * bands + band
+// This provides better cache locality than nested slices.
+func (c *COG) decodeBytesToFlat(data []byte, width, height, bands int, dataType DataType, byteOrder binary.ByteOrder, photometricInterpretation uint16) []uint64 {
+	// Allocate flat result array - single allocation
+	totalPixels := width * height * bands
+	result := make([]uint64, totalPixels)
 
 	bytesPerSample := c.getBytesPerSample(dataType)
 	bytesPerPixel := bands * bytesPerSample
 
-	// Decode each pixel
+	// Decode each pixel - optimized loop order for cache locality
 	for y := 0; y < height; y++ {
+		rowOffset := y * width * bands
 		for x := 0; x < width; x++ {
 			pixelOffset := (y*width + x) * bytesPerPixel
+			resultBase := rowOffset + x*bands
 
 			// Decode each band for this pixel
 			for b := 0; b < bands; b++ {
@@ -863,7 +1109,7 @@ func (c *COG) decodeBytesTo3D(data []byte, width, height, bands int, dataType Da
 					value = uint64(data[sampleOffset])
 				}
 
-				result[b][x][y] = value
+				result[resultBase+b] = value
 			}
 		}
 	}
@@ -876,7 +1122,7 @@ func (c *COG) decodeBytesTo3D(data []byte, width, height, bands int, dataType Da
 		case DTByte, DTASCII, DTUndefined:
 			maxValue = 255
 		case DTSByte:
-			maxValue = 127 // Actually -128 to 127, but we treat as 0-255
+			maxValue = 127
 		case DTSShort:
 			maxValue = 65535
 		case DTSShortS:
@@ -886,12 +1132,10 @@ func (c *COG) decodeBytesTo3D(data []byte, width, height, bands int, dataType Da
 		case DTSLongS:
 			maxValue = 2147483647
 		default:
-			maxValue = 255 // Default
+			maxValue = 255
 		}
-		for y := 0; y < height; y++ {
-			for x := 0; x < width; x++ {
-				result[0][x][y] = maxValue - result[0][x][y]
-			}
+		for i := range result {
+			result[i] = maxValue - result[i]
 		}
 	}
 
@@ -959,8 +1203,8 @@ func (c *COG) ReadWindow(rect Rectangle) (*RasterData, error) {
 		return nil, fmt.Errorf("IFD %d not found", overviewIndex)
 	}
 
-	// Decode bytes to 3D uint64 slice
-	decodedData := c.decodeBytesTo3D(data, overviewWidth, overviewHeight, meta.BandCount, meta.DataType, ifd.ByteOrder, meta.PhotometricInterpretation)
+	// Decode bytes to flat uint64 slice
+	decodedData := c.decodeBytesToFlat(data, overviewWidth, overviewHeight, meta.BandCount, meta.DataType, ifd.ByteOrder, meta.PhotometricInterpretation)
 
 	// Calculate geographic bounds using main image georeferencing
 	mainGTR := c.geoTIFFs[0]
@@ -1107,8 +1351,8 @@ func (c *COG) ReadTile(tile maptile.Tile, tileSize ...int) (*RasterData, error) 
 		return nil, fmt.Errorf("IFD 0 not found")
 	}
 
-	// Decode bytes to 3D uint64 slice
-	decodedData := c.decodeBytesTo3D(data, width, height, meta.BandCount, meta.DataType, ifd.ByteOrder, meta.PhotometricInterpretation)
+	// Decode bytes to flat uint64 slice
+	decodedData := c.decodeBytesToFlat(data, width, height, meta.BandCount, meta.DataType, ifd.ByteOrder, meta.PhotometricInterpretation)
 
 	return &RasterData{
 		Data:   decodedData,

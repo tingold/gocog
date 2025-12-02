@@ -215,8 +215,8 @@ func TestCOG_ReadTile(t *testing.T) {
 	if tileData.Bands == 0 {
 		t.Logf("Expected bands > 0, got %d\n", tileData.Bands)
 	}
-	if len(tileData.Data) == 0 || len(tileData.Data[0]) == 0 || len(tileData.Data[0][0]) == 0 {
-		t.Logf("Expected non-empty data, got empty 3D slice\n")
+	if len(tileData.Data) == 0 {
+		t.Logf("Expected non-empty data, got empty data slice\n")
 	}
 
 	t.Logf("Tile read successfully: %dx%d pixels, %d bands\n",
@@ -344,7 +344,6 @@ func writeTileToPNG(tileData *gocog.RasterData, filename string, dataType gocog.
 	var img image.Image
 	width := tileData.Width
 	height := tileData.Height
-	data := tileData.Data // data is [band][x][y]
 
 	switch tileData.Bands {
 	case 1:
@@ -352,13 +351,11 @@ func writeTileToPNG(tileData *gocog.RasterData, filename string, dataType gocog.
 		grayImg := image.NewGray(image.Rect(0, 0, width, height))
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
-				if len(data) > 0 && len(data[0]) > x && len(data[0][x]) > y {
-					value := data[0][x][y]
-					if value > 255 {
-						value = 255
-					}
-					grayImg.SetGray(x, y, color.Gray{Y: uint8(value)})
+				value := tileData.At(0, x, y)
+				if value > 255 {
+					value = 255
 				}
+				grayImg.SetGray(x, y, color.Gray{Y: uint8(value)})
 			}
 		}
 		img = grayImg
@@ -368,26 +365,24 @@ func writeTileToPNG(tileData *gocog.RasterData, filename string, dataType gocog.
 		rgbaImg := image.NewRGBA(image.Rect(0, 0, width, height))
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
-				if len(data) >= 3 && len(data[0]) > x && len(data[0][x]) > y {
-					r := data[0][x][y]
-					g := data[1][x][y]
-					b := data[2][x][y]
-					if r > 255 {
-						r = 255
-					}
-					if g > 255 {
-						g = 255
-					}
-					if b > 255 {
-						b = 255
-					}
-					rgbaImg.Set(x, y, color.RGBA{
-						R: uint8(r),
-						G: uint8(g),
-						B: uint8(b),
-						A: 255,
-					})
+				r := tileData.At(0, x, y)
+				g := tileData.At(1, x, y)
+				b := tileData.At(2, x, y)
+				if r > 255 {
+					r = 255
 				}
+				if g > 255 {
+					g = 255
+				}
+				if b > 255 {
+					b = 255
+				}
+				rgbaImg.Set(x, y, color.RGBA{
+					R: uint8(r),
+					G: uint8(g),
+					B: uint8(b),
+					A: 255,
+				})
 			}
 		}
 		img = rgbaImg
@@ -397,30 +392,28 @@ func writeTileToPNG(tileData *gocog.RasterData, filename string, dataType gocog.
 		rgbaImg := image.NewRGBA(image.Rect(0, 0, width, height))
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
-				if len(data) >= 4 && len(data[0]) > x && len(data[0][x]) > y {
-					r := data[0][x][y]
-					g := data[1][x][y]
-					b := data[2][x][y]
-					a := data[3][x][y]
-					if r > 255 {
-						r = 255
-					}
-					if g > 255 {
-						g = 255
-					}
-					if b > 255 {
-						b = 255
-					}
-					if a > 255 {
-						a = 255
-					}
-					rgbaImg.Set(x, y, color.RGBA{
-						R: uint8(r),
-						G: uint8(g),
-						B: uint8(b),
-						A: uint8(a),
-					})
+				r := tileData.At(0, x, y)
+				g := tileData.At(1, x, y)
+				b := tileData.At(2, x, y)
+				a := tileData.At(3, x, y)
+				if r > 255 {
+					r = 255
 				}
+				if g > 255 {
+					g = 255
+				}
+				if b > 255 {
+					b = 255
+				}
+				if a > 255 {
+					a = 255
+				}
+				rgbaImg.Set(x, y, color.RGBA{
+					R: uint8(r),
+					G: uint8(g),
+					B: uint8(b),
+					A: uint8(a),
+				})
 			}
 		}
 		img = rgbaImg
@@ -430,13 +423,11 @@ func writeTileToPNG(tileData *gocog.RasterData, filename string, dataType gocog.
 		grayImg := image.NewGray(image.Rect(0, 0, width, height))
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
-				if len(data) > 0 && len(data[0]) > x && len(data[0][x]) > y {
-					value := data[0][x][y]
-					if value > 255 {
-						value = 255
-					}
-					grayImg.SetGray(x, y, color.Gray{Y: uint8(value)})
+				value := tileData.At(0, x, y)
+				if value > 255 {
+					value = 255
 				}
+				grayImg.SetGray(x, y, color.Gray{Y: uint8(value)})
 			}
 		}
 		img = grayImg
