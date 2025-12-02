@@ -150,11 +150,16 @@ The library is optimized for high performance with the following features:
 
 gocog is a pure Go implementation that avoids the overhead of Python's interpreter and GDAL's C library infrastructure. When comparing metadata retrieval operations against rasterio (Python library using GDAL):
 
-| File | gocog | rasterio | Speedup |
-|------|-------|----------|---------|
-| TCI.tif (local, 15360x15872, 3 bands) | ~242µs | ~28ms | **~115x faster** |
-| B12.tif (local, 7680x8192, 1 band) | ~280µs | ~30ms | **~108x faster** |
-| TCI.tif (remote, HTTP) | ~707ms | ~984ms | **~1.4x faster** |
+  ╔════════════════════════════════════════════════════════════════════════╗
+  ║                  GOCOG vs RASTERIO PERFORMANCE                         ║
+  ║                  GOCOG vs RASTERIO PERFORMANCE                         ║
+  ╠═══════════════════════╦═══════════════╦═══════════════╦════════════════╣
+  ║ File                  ║ gocog         ║ rasterio      ║ Speedup        ║
+  ╠═══════════════════════╬═══════════════╬═══════════════╬════════════════╣
+  ║ TCI.tif (local)       ║ 319µs         ║ 21.774ms      ║ 68.27x faster  ║
+  ║ B12.tif (local)       ║ 199µs         ║ 22.326ms      ║ 112.44x faster ║
+  ║ TCI.tif (remote)      ║ 548.399ms     ║ 963.965ms     ║ 1.76x faster   ║
+  ╚═══════════════════════╩═══════════════╩═══════════════╩════════════════╝
 
 Run the rasterio comparison tests yourself:
 
