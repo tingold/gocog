@@ -33,6 +33,7 @@ import (
     "fmt"
     "github.com/tingold/gocog"
     "github.com/paulmach/orb"
+    "github.com/paulmach/orb/maptile"
 )
 
 func main() {
@@ -62,6 +63,32 @@ func main() {
     }
     
     fmt.Printf("Read region: %dx%d pixels\n", data.Width, data.Height)
+    
+    // Read a map tile (XYZ tile format)
+    // Create a tile at zoom level 10 using the center point of the bounds
+    centerPoint := orb.Point{
+        (bounds.Min[0] + bounds.Max[0]) / 2,
+        (bounds.Min[1] + bounds.Max[1]) / 2,
+    }
+    zoom := maptile.Zoom(10)
+    tile := maptile.At(centerPoint, zoom)
+    
+    tileData, err := cog.ReadTile(tile) // Defaults to 256x256 pixels
+    if err != nil {
+        panic(err)
+    }
+    
+    fmt.Printf("Read tile: %dx%d pixels, %d bands\n", 
+        tileData.Width, tileData.Height, tileData.Bands)
+    
+    // Read a tile with custom size (512x512)
+    customTileData, err := cog.ReadTile(tile, 512)
+    if err != nil {
+        panic(err)
+    }
+    
+    fmt.Printf("Read custom size tile: %dx%d pixels\n", 
+        customTileData.Width, customTileData.Height)
 }
 ```
 
